@@ -35,6 +35,8 @@ parser = argparse.ArgumentParser(
     epilog=examples)
 parser.add_argument("-t", "--timestamp", action="store_true",
     help="include timestamp on output")
+parser.add_argument("--track-only-backlog-drop", action="store_true",
+    help="trace only listen backlog dropped packets")
 parser.add_argument("-p", "--pid",
     help="trace this PID only")
 parser.add_argument("--ebpf", action="store_true",
@@ -52,6 +54,8 @@ bpf_text = """
 struct ipv4_data_t {
     u64 ts_us;
     u32 pid;
+    u32 backlog;
+    u32 max_backlog;
     u32 saddr;
     u32 daddr;
     u64 ip;
@@ -63,6 +67,8 @@ BPF_PERF_OUTPUT(ipv4_events);
 struct ipv6_data_t {
     u64 ts_us;
     u32 pid;
+    u32 backlog;
+    u32 max_backlog;
     unsigned __int128 saddr;
     unsigned __int128 daddr;
     u64 ip;
@@ -126,6 +132,8 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
     if (protocol != IPPROTO_TCP)
         return 0;
 
+    ##TRACK_ONLY_BACKLOG_DROP##
+
     // pull in details
     u16 family = 0, lport = 0;
     family = newsk->__sk_common.skc_family;
@@ -133,6 +141,8 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 
     if (family == AF_INET) {
         struct ipv4_data_t data4 = {.pid = pid, .ip = 4};
+        data4.backlog = newsk->sk_ack_backlog;
+        data4.max_backlog = newsk->sk_max_ack_backlog;
         data4.ts_us = bpf_ktime_get_ns() / 1000;
         data4.saddr = newsk->__sk_common.skc_rcv_saddr;
         data4.daddr = newsk->__sk_common.skc_daddr;
@@ -142,6 +152,8 @@ int kretprobe__inet_csk_accept(struct pt_regs *ctx)
 
     } else if (family == AF_INET6) {
         struct ipv6_data_t data6 = {.pid = pid, .ip = 6};
+        data6.backlog = newsk->sk_ack_backlog;
+        data6.max_backlog = newsk->sk_max_ack_backlog;
         data6.ts_us = bpf_ktime_get_ns() / 1000;
         bpf_probe_read(&data6.saddr, sizeof(data6.saddr),
             &newsk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
@@ -162,9 +174,14 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state)
 {
     if (args->protocol != IPPROTO_TCP)
         return 0;
+
     u32 pid = bpf_get_current_pid_tgid();
 
     ##FILTER_PID##
+
+    struct sock *newsk = (struct sock *) args->skaddr;
+
+    ##TRACK_ONLY_BACKLOG_DROP##
 
     // pull in details
     u16 family = 0, lport = 0;
@@ -174,6 +191,8 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state)
     if (family == AF_INET) {
         struct ipv4_data_t data4 = {.pid = pid, .ip = 4};
         data4.ts_us = bpf_ktime_get_ns() / 1000;
+        data4.backlog = newsk->sk_ack_backlog;
+        data4.max_backlog = newsk->sk_max_ack_backlog;
         __builtin_memcpy(&data4.saddr, args->saddr, sizeof(data4.saddr));
         __builtin_memcpy(&data4.daddr, args->daddr, sizeof(data4.daddr));
         data4.lport = lport;
@@ -182,6 +201,8 @@ TRACEPOINT_PROBE(sock, inet_sock_set_state)
     } else if (family == AF_INET6) {
         struct ipv6_data_t data6 = {.pid = pid, .ip = 6};
         data6.ts_us = bpf_ktime_get_ns() / 1000;
+        data6.backlog = newsk->sk_ack_backlog;
+        data6.max_backlog = newsk->sk_max_ack_backlog;
         __builtin_memcpy(&data6.saddr, args->saddr, sizeof(data6.saddr));
         __builtin_memcpy(&data6.daddr, args->daddr, sizeof(data6.daddr));
         data6.lport = lport;
@@ -206,6 +227,14 @@ if args.pid:
         'if (pid != %s) { return 0; }' % args.pid)
 else:
     bpf_text = bpf_text.replace('##FILTER_PID##', '')
+
+if args.track_only_backlog_drop:
+    bpf_text = bpf_text.replace(
+      '##TRACK_ONLY_BACKLOG_DROP##',
+      'if (newsk->sk_ack_backlog < newsk->sk_max_ack_backlog) return 0;')
+else:
+    bpf_text = bpf_text.replace('##TRACK_ONLY_BACKLOG_DROP##', '')
+
 if debug or args.ebpf:
     print(bpf_text)
     if args.ebpf:
@@ -218,6 +247,8 @@ class Data_ipv4(ct.Structure):
     _fields_ = [
         ("ts_us", ct.c_ulonglong),
         ("pid", ct.c_uint),
+        ("backlog", ct.c_uint),
+        ("max_backlog", ct.c_uint),
         ("saddr", ct.c_uint),
         ("daddr", ct.c_uint),
         ("ip", ct.c_ulonglong),
@@ -229,6 +260,8 @@ class Data_ipv6(ct.Structure):
     _fields_ = [
         ("ts_us", ct.c_ulonglong),
         ("pid", ct.c_uint),
+        ("backlog", ct.c_uint),
+        ("max_backlog", ct.c_uint),
         ("saddr", (ct.c_ulonglong * 2)),
         ("daddr", (ct.c_ulonglong * 2)),
         ("ip", ct.c_ulonglong),
@@ -244,11 +277,19 @@ def print_ipv4_event(cpu, data, size):
         if start_ts == 0:
             start_ts = event.ts_us
         print("%-9.3f" % ((float(event.ts_us) - start_ts) / 1000000), end="")
-    printb(b"%-6d %-12.12s %-2d %-16s %-16s %-4d" % (event.pid,
-        event.task, event.ip,
-        inet_ntop(AF_INET, pack("I", event.daddr)).encode(),
-        inet_ntop(AF_INET, pack("I", event.saddr)).encode(),
-        event.lport))
+
+    fields = [event.pid,
+              event.task,
+              event.ip,
+              inet_ntop(AF_INET, pack("I", event.daddr)).encode(),
+              inet_ntop(AF_INET, pack("I", event.saddr)).encode(),
+              event.lport,
+              ]
+
+    if args.track_only_backlog_drop:
+        fields +=[event.backlog, event.max_backlog]
+
+    printb(format_ % tuple(fields))
 
 def print_ipv6_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(Data_ipv6)).contents
@@ -257,23 +298,46 @@ def print_ipv6_event(cpu, data, size):
         if start_ts == 0:
             start_ts = event.ts_us
         print("%-9.3f" % ((float(event.ts_us) - start_ts) / 1000000), end="")
-    printb(b"%-6d %-12.12s %-2d %-16s %-16s %-4d" % (event.pid,
-        event.task, event.ip,
-        inet_ntop(AF_INET6, event.daddr).encode(),
-        inet_ntop(AF_INET6, event.saddr).encode(),
-        event.lport))
+
+    fields = [event.pid,
+              event.task,
+              event.ip,
+              inet_ntop(AF_INET6, event.daddr).encode(),
+              inet_ntop(AF_INET6, event.saddr).encode(),
+              event.lport,
+              ]
+
+    if args.track_only_backlog_drop:
+        fields += [event.backlog, event.max_backlog]
+
+    printb(format_ % tuple(fields))
 
 # initialize BPF
 b = BPF(text=bpf_text)
 
+# common format and fields
+format_ = b"%-6d %-12.12s %-2d %-16s %-16s %-4d"
+header = ["PID",
+          "COMM",
+          "IP",
+          "RADDR",
+          "LADDR",
+          "LPORT"]
+
+
 # header
 if args.timestamp:
     print("%-9s" % ("TIME(s)"), end="")
-print("%-6s %-12s %-2s %-16s %-16s %-4s" % ("PID", "COMM", "IP", "RADDR",
-    "LADDR", "LPORT"))
+
+if args.track_only_backlog_drop:
+    format_ = b"%-6d %-12.12s %-2d %-16s %-16s %-6d %-8d %-11d "
+    header += ["BACKLOG", "MAX_BACKLOG"]
+    print("%-6s %-12s %-2s %-16s %-16s %-4s %-8s %-11s" % tuple(header))
+else:
+    print("%-6s %-12s %-2s %-16s %-16s %-4s" % tuple(header))
+
 
 start_ts = 0
-
 # read events
 b["ipv4_events"].open_perf_buffer(print_ipv4_event)
 b["ipv6_events"].open_perf_buffer(print_ipv6_event)
