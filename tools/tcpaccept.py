@@ -67,8 +67,8 @@ BPF_PERF_OUTPUT(ipv4_events);
 struct ipv6_data_t {
     u64 ts_us;
     u32 pid;
-    u32 backlog;
-    u32 max_backlog;
+    u64 backlog;
+    u64 max_backlog;
     unsigned __int128 saddr;
     unsigned __int128 daddr;
     u64 ip;
@@ -260,8 +260,8 @@ class Data_ipv6(ct.Structure):
     _fields_ = [
         ("ts_us", ct.c_ulonglong),
         ("pid", ct.c_uint),
-        ("backlog", ct.c_uint),
-        ("max_backlog", ct.c_uint),
+        ("backlog", ct.c_ulonglong),
+        ("max_backlog", ct.c_ulonglong),
         ("saddr", (ct.c_ulonglong * 2)),
         ("daddr", (ct.c_ulonglong * 2)),
         ("ip", ct.c_ulonglong),
